@@ -5,6 +5,7 @@ using System.Drawing;
 using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
 using System.Diagnostics;
+using System.Globalization;
 using System.Threading;
 using System.Collections.Generic;
 using System.Windows.Forms;
@@ -37,6 +38,10 @@ namespace PowerPointVideoPlayer
         private bool isPaused = false;
         private bool trackEndHandled = false;
         private bool controlsVisible = false;
+        private bool isDraggingSeekBar = false;
+        private double seekPreviewSeconds = 0;
+        private double mediaDurationSeconds = 0;
+        private double playbackStartOffset = 0;
 
         private Process videoProcess;
         private Process audioProcess;
@@ -259,13 +264,16 @@ namespace PowerPointVideoPlayer
             }
         }
 
-        private void StartPlayback(string file)
+        private void StartPlayback(string file, double startAtSeconds = 0)
         {
             try
             {
                 isReading = true;
                 isPaused = false;
                 trackEndHandled = false;
+                playbackStartOffset = Math.Max(0, startAtSeconds);
+                mediaDurationSeconds = GetMediaDuration(file);
+                seekPreviewSeconds = playbackStartOffset;
                 audioReady.Reset();
                 currentFrame = null;
                 lock (frameLock)
@@ -300,6 +308,7 @@ namespace PowerPointVideoPlayer
 
                 videoInfo.Arguments =
                     "-nostdin -loglevel error " +
+                    "-ss " + playbackStartOffset.ToString(CultureInfo.InvariantCulture) + " " +
                     "-i \"" + file + "\" " +
                     "-vf \"scale=1280:720:force_original_aspect_ratio=decrease," +
                     "pad=1280:720:(ow-iw)/2:(oh-ih)/2,fps=30\" " +
@@ -325,6 +334,7 @@ namespace PowerPointVideoPlayer
 
                 audioInfo.Arguments =
                     "-nostdin -loglevel error " +
+                    "-ss " + playbackStartOffset.ToString(CultureInfo.InvariantCulture) + " " +
                     "-i \"" + file + "\" " +
                     "-vn -sn " +
                     "-ac 2 -ar 44100 " +
@@ -400,7 +410,7 @@ namespace PowerPointVideoPlayer
 
                     videoFrame.Data = frame;
                     videoFrame.Timestamp =
-                        frameNumber / (double)VIDEO_FPS;
+                        playbackStartOffset + frameNumber / (double)VIDEO_FPS;
 
                     frameNumber++;
 
@@ -545,7 +555,7 @@ namespace PowerPointVideoPlayer
 
             if (audioClock != null)
             {
-                double audioTime = audioClock.SecondsPlayed;
+                double audioTime = playbackStartOffset + audioClock.SecondsPlayed;
 
                 lock (frameLock)
                 {
@@ -615,11 +625,13 @@ namespace PowerPointVideoPlayer
             GL.Disable(EnableCap.Texture2D);
             GL.Color4(0.07f, 0.08f, 0.11f, 0.94f);
             GL.Begin(PrimitiveType.Quads);
-            GL.Vertex2(0, Height - 66);
-            GL.Vertex2(Width, Height - 66);
+            GL.Vertex2(0, Height - 100);
+            GL.Vertex2(Width, Height - 100);
             GL.Vertex2(Width, Height);
             GL.Vertex2(0, Height);
             GL.End();
+
+            DrawSeekBar();
 
             DrawButton(12, Height - 55, 76, 42, "OPEN");
             DrawButton(98, Height - 55, 76, 42, "PREV");
@@ -659,6 +671,131 @@ namespace PowerPointVideoPlayer
             GL.MatrixMode(MatrixMode.Modelview);
         }
 
+        private double GetPlaybackPosition()
+        {
+            if (isDraggingSeekBar)
+                return seekPreviewSeconds;
+
+            if (audioClock != null)
+                return Math.Min(mediaDurationSeconds > 0 ? mediaDurationSeconds : double.MaxValue,
+                    playbackStartOffset + audioClock.SecondsPlayed);
+
+            return playbackStartOffset;
+        }
+
+        private string FormatTime(double seconds)
+        {
+            if (double.IsNaN(seconds) || double.IsInfinity(seconds) || seconds < 0)
+                seconds = 0;
+
+            TimeSpan time = TimeSpan.FromSeconds(seconds);
+            int totalMinutes = (int)Math.Floor(time.TotalMinutes);
+            return totalMinutes.ToString("00") + ":" + time.Seconds.ToString("00");
+        }
+
+        private void DrawSeekBar()
+        {
+            int left = 16;
+            int right = Math.Max(left + 1, Width - 16);
+            int barY = Height - 88;
+            int barHeight = 6;
+
+            double position = GetPlaybackPosition();
+            double progress = mediaDurationSeconds > 0
+                ? Math.Max(0, Math.Min(1, position / mediaDurationSeconds))
+                : 0;
+
+            GL.Disable(EnableCap.Texture2D);
+
+            // Фоновая дорожка.
+            GL.Color4(0.30f, 0.32f, 0.37f, 1f);
+            GL.Begin(PrimitiveType.Quads);
+            GL.Vertex2(left, barY);
+            GL.Vertex2(right, barY);
+            GL.Vertex2(right, barY + barHeight);
+            GL.Vertex2(left, barY + barHeight);
+            GL.End();
+
+            // Заполненная часть.
+            int filled = left + (int)((right - left) * progress);
+            GL.Color4(0.20f, 0.65f, 0.95f, 1f);
+            GL.Begin(PrimitiveType.Quads);
+            GL.Vertex2(left, barY);
+            GL.Vertex2(filled, barY);
+            GL.Vertex2(filled, barY + barHeight);
+            GL.Vertex2(left, barY + barHeight);
+            GL.End();
+
+            // Ползунок.
+            GL.Color4(1f, 1f, 1f, 1f);
+            GL.Begin(PrimitiveType.Quads);
+            GL.Vertex2(filled - 4, barY - 3);
+            GL.Vertex2(filled + 4, barY - 3);
+            GL.Vertex2(filled + 4, barY + barHeight + 3);
+            GL.Vertex2(filled - 4, barY + barHeight + 3);
+            GL.End();
+
+            GL.Enable(EnableCap.Texture2D);
+            DrawText(FormatTime(position), left, Height - 78, 52, 14);
+            DrawText(FormatTime(mediaDurationSeconds), Math.Max(left + 60, right - 52), Height - 78, 52, 14);
+        }
+
+        private void UpdateSeekPreview(int mouseX)
+        {
+            if (mediaDurationSeconds <= 0 || Width <= 32)
+                return;
+
+            double fraction = (mouseX - 16.0) / (Width - 32.0);
+            fraction = Math.Max(0, Math.Min(1, fraction));
+            seekPreviewSeconds = fraction * mediaDurationSeconds;
+        }
+
+        private void SeekTo(double seconds)
+        {
+            if (currentTrackIndex < 0 || currentTrackIndex >= playlist.Count || mediaDurationSeconds <= 0)
+                return;
+
+            seconds = Math.Max(0, Math.Min(mediaDurationSeconds, seconds));
+            StopPlayback();
+            StartPlayback(playlist[currentTrackIndex], seconds);
+        }
+
+        private double GetMediaDuration(string file)
+        {
+            try
+            {
+                ProcessStartInfo info = new ProcessStartInfo();
+                info.FileName = "ffprobe";
+                info.Arguments = "-v error -show_entries format=duration " +
+                    "-of default=noprint_wrappers=1:nokey=1 \"" + file + "\"";
+                info.UseShellExecute = false;
+                info.CreateNoWindow = true;
+                info.RedirectStandardOutput = true;
+
+                using (Process probe = Process.Start(info))
+                {
+                    string output = probe.StandardOutput.ReadToEnd();
+                    if (!probe.WaitForExit(5000))
+                    {
+                        try { probe.Kill(); } catch { }
+                        return 0;
+                    }
+
+                    double duration;
+                    if (double.TryParse(output.Trim(), NumberStyles.Float,
+                        CultureInfo.InvariantCulture, out duration) && duration > 0)
+                        return duration;
+                }
+            }
+            catch
+            {
+                // Если ffprobe недоступен, воспроизведение продолжится,
+                // но длительность и перемотка будут недоступны.
+            }
+
+            return 0;
+        }
+
         private void DrawButton(int x, int y, int width, int height, string label)
         {
             GL.Disable(EnableCap.Texture2D);
@@ -678,6 +815,14 @@ namespace PowerPointVideoPlayer
             int texture;
             if (!textTextures.TryGetValue(value, out texture))
             {
+                // Ограничиваем кеш, поскольку время на полоске меняется каждую секунду.
+                if (textTextures.Count >= 128)
+                {
+                    foreach (int oldTexture in textTextures.Values)
+                        GL.DeleteTexture(oldTexture);
+                    textTextures.Clear();
+                }
+
                 using (Bitmap bitmap = new Bitmap(Math.Max(64, value.Length * 12), 28))
                 using (Graphics graphics = Graphics.FromImage(bitmap))
                 using (Font font = new Font("Arial", 12, FontStyle.Bold))
@@ -723,7 +868,10 @@ namespace PowerPointVideoPlayer
 
             // Панель видна только когда курсор находится в нижней
             // области окна, где расположены кнопки и плейлист.
-            controlsVisible = e.Y >= Height - 100;
+            controlsVisible = isDraggingSeekBar || e.Y >= Height - 100;
+
+            if (isDraggingSeekBar)
+                UpdateSeekPreview(e.X);
         }
 
         protected override void OnMouseDown(MouseButtonEventArgs e)
@@ -733,7 +881,15 @@ namespace PowerPointVideoPlayer
             if (!controlsVisible) return;
 
             int y = e.Y;
-            if (y >= Height - 66)
+            if (y >= Height - 96 && y <= Height - 80)
+            {
+                if (mediaDurationSeconds > 0)
+                {
+                    isDraggingSeekBar = true;
+                    UpdateSeekPreview(e.X);
+                }
+            }
+            else if (y >= Height - 66)
             {
                 int x = e.X;
                 if (x >= 12 && x <= 88) OpenVideo();
@@ -748,6 +904,17 @@ namespace PowerPointVideoPlayer
                 int row = (y - (Height - 59)) / 14;
                 if (row >= 0 && row < visible)
                     PlayTrack(start + row);
+            }
+        }
+
+        protected override void OnMouseUp(MouseButtonEventArgs e)
+        {
+            base.OnMouseUp(e);
+
+            if (e.Button == MouseButton.Left && isDraggingSeekBar)
+            {
+                isDraggingSeekBar = false;
+                SeekTo(seekPreviewSeconds);
             }
         }
 
