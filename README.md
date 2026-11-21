@@ -1,7 +1,8 @@
 # PowerPoint Video Player
 
 A video player for Microsoft PowerPoint using OpenGL, FFmpeg and NAudio.
-
+## Languages
+[English](README.md) | [Русский](README-ru.md)
 ## Features
 
 - Video playback inside PowerPoint Slide Show.
